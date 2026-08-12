@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 
 mod cli;
 mod commands;
+mod process_title;
 
 use crate::command_prelude::*;
 
 fn main() {
+    process_title::set_from_env();
     let _guard = setup_logger();
 
     let mut gctx = match GlobalContext::default() {
