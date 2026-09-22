@@ -377,16 +377,25 @@ impl<'gctx> InstallablePackage<'gctx> {
         if !self.source_id.is_path() {
             let target_dir = if let Some(dir) = self.gctx.target_dir()? {
                 dir
-            } else if let Ok(td) = TempFileBuilder::new().prefix("cargo-install").tempdir() {
-                let p = td.path().to_owned();
-                td_opt = Some(td);
-                Filesystem::new(p)
             } else {
-                needs_cleanup = true;
-                Filesystem::new(self.gctx.cwd().join("target-install"))
+                self.gctx.validate_target_dir_policy_prefix(
+                    &env::temp_dir().join("cargo-install"),
+                    self.ws.build_dir().as_path_unlocked(),
+                )?;
+
+                if let Ok(td) = TempFileBuilder::new().prefix("cargo-install").tempdir() {
+                    let p = td.path().to_owned();
+                    td_opt = Some(td);
+                    Filesystem::new(p)
+                } else {
+                    needs_cleanup = true;
+                    Filesystem::new(self.gctx.cwd().join("target-install"))
+                }
             };
             self.ws.set_target_dir(target_dir);
         }
+
+        self.ws.validate_target_dir_policy()?;
 
         self.check_yanked_install()?;
 

@@ -749,6 +749,7 @@ fn build_lock(
     let mut orig_resolve = ops::load_pkg_lockfile(ws)?;
 
     let mut tmp_ws = Workspace::ephemeral(publish_pkg.clone(), ws.gctx(), None, true)?;
+    tmp_ws.validate_target_dir_policy()?;
 
     // The local registry is an overlay used for simulating workspace packages
     // that are supposed to be in the published registry, but that aren't there

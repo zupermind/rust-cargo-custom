@@ -238,6 +238,7 @@ impl<'gctx> Workspace<'gctx> {
         ws.find_members()?;
         ws.set_resolve_behavior()?;
         ws.validate()?;
+        ws.validate_target_dir_policy()?;
         Ok(ws)
     }
 
@@ -303,7 +304,21 @@ impl<'gctx> Workspace<'gctx> {
         ws.member_ids.insert(id);
         ws.default_members.push(ws.current_manifest.clone());
         ws.set_resolve_behavior()?;
+        // A caller may replace the default target directory after constructing
+        // an ephemeral workspace (cargo install does this for its tempfile).
+        // Validate an explicit selection here and let that caller validate the
+        // final selection after its override.
+        if ws.target_dir.is_some() {
+            ws.validate_target_dir_policy()?;
+        }
         Ok(ws)
+    }
+
+    pub fn validate_target_dir_policy(&self) -> CargoResult<()> {
+        let target_dir = self.target_dir();
+        let build_dir = self.build_dir();
+        self.gctx
+            .validate_target_dir_policy(target_dir.as_path_unlocked(), build_dir.as_path_unlocked())
     }
 
     /// Reloads the workspace.

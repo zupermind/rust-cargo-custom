@@ -3322,6 +3322,55 @@ fn custom_target_dir_env() {
     assert!(p.root().join("target/debug").join(&exe_name).is_file());
 }
 
+#[cfg(unix)]
+#[cargo_test]
+fn zuper_target_root_policy_allows_final_target_and_build_dirs() {
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [build]
+                build-dir = "allowed-build"
+            "#,
+        )
+        .build();
+
+    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build --target-dir allowed-target")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .env("ZUPER_CARGO_TARGET_ROOT", p.root())
+        .run();
+
+    assert!(p.root().join("allowed-target").is_dir());
+    assert!(p.root().join("allowed-build").is_dir());
+}
+
+#[cfg(unix)]
+#[cargo_test]
+fn zuper_target_root_policy_rejects_before_directory_mutation() {
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [build]
+                build-dir = "allowed-build"
+            "#,
+        )
+        .build();
+    let allowed_root = p.root().join("allowed-root");
+    let outside_target = p.root().join("outside-target");
+
+    p.cargo("build --target-dir outside-target")
+        .env("ZUPER_CARGO_TARGET_ROOT", &allowed_root)
+        .with_status(101)
+        .with_stderr_contains("[ERROR] [..]ZUPER_CARGO_TARGET_ROOT[..]")
+        .run();
+
+    assert!(!outside_target.exists());
+    assert!(!p.root().join("allowed-build").exists());
+}
+
 #[cargo_test]
 fn custom_target_dir_line_parameter() {
     let p = project().file("src/main.rs", "fn main() {}").build();
