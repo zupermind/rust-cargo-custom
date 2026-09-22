@@ -70,6 +70,8 @@ use std::fs::{self, File};
 use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::mem;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
@@ -184,6 +186,39 @@ pub const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "target",
     "term",
 ];
+
+const ZUPER_CARGO_TARGET_ROOT: &str = "ZUPER_CARGO_TARGET_ROOT";
+
+#[cfg(unix)]
+fn parse_target_root_policy(raw: &OsStr) -> CargoResult<Vec<OsString>> {
+    let raw_bytes = raw.as_bytes();
+    if raw_bytes.is_empty() {
+        bail!(
+            "`{ZUPER_CARGO_TARGET_ROOT}` is invalid: the value is empty; configure one or more absolute path prefixes"
+        );
+    }
+
+    let roots = raw_bytes
+        .split(|byte| *byte == b':')
+        .map(OsStr::from_bytes)
+        .collect::<Vec<_>>();
+    for root in &roots {
+        if root.is_empty() {
+            bail!(
+                "`{ZUPER_CARGO_TARGET_ROOT}` is invalid: empty allowed root in `{}`; every entry must be a nonempty absolute path",
+                raw.to_string_lossy()
+            );
+        }
+        if !Path::new(root).is_absolute() {
+            bail!(
+                "`{ZUPER_CARGO_TARGET_ROOT}` is invalid: allowed root `{}` is relative; every entry must be an absolute path",
+                root.to_string_lossy()
+            );
+        }
+    }
+
+    Ok(roots.into_iter().map(OsStr::to_os_string).collect())
+}
 
 /// Indicates why a config value is being loaded.
 #[derive(Clone, Copy, Debug)]
@@ -720,6 +755,98 @@ impl GlobalContext {
             Ok(Some(Filesystem::new(path)))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Checks the final Cargo target and build directories against the optional
+    /// operator supplied target-root policy.
+    pub fn validate_target_dir_policy(
+        &self,
+        target_dir: &Path,
+        build_dir: &Path,
+    ) -> CargoResult<()> {
+        let Some(raw_roots) = self.get_env_os(ZUPER_CARGO_TARGET_ROOT) else {
+            return Ok(());
+        };
+
+        #[cfg(not(unix))]
+        {
+            let _ = (raw_roots, target_dir, build_dir);
+            bail!(
+                "`{ZUPER_CARGO_TARGET_ROOT}` is set, but target-root policy is unsupported on this platform"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let roots = parse_target_root_policy(raw_roots)?;
+            let roots_display = roots.iter().map(|root| root.to_string_lossy()).join(":");
+
+            for (role, path) in [("target", target_dir), ("build", build_dir)] {
+                if !roots
+                    .iter()
+                    .any(|root| path.as_os_str().as_bytes().starts_with(root.as_bytes()))
+                {
+                    bail!(
+                        "`{ZUPER_CARGO_TARGET_ROOT}` rejects the {role} directory `{}`: it does not have a literal prefix match in the configured allowed roots `{roots_display}`; select a matching directory or correct `{ZUPER_CARGO_TARGET_ROOT}`",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Performs the part of the target-root check that is possible before a
+    /// tempfile name is allocated. A root longer than `target_prefix` remains
+    /// possible and is checked again against the final path after allocation.
+    pub fn validate_target_dir_policy_prefix(
+        &self,
+        target_prefix: &Path,
+        build_dir: &Path,
+    ) -> CargoResult<()> {
+        let Some(raw_roots) = self.get_env_os(ZUPER_CARGO_TARGET_ROOT) else {
+            return Ok(());
+        };
+
+        #[cfg(not(unix))]
+        {
+            let _ = (raw_roots, target_prefix, build_dir);
+            bail!(
+                "`{ZUPER_CARGO_TARGET_ROOT}` is set, but target-root policy is unsupported on this platform"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let roots = parse_target_root_policy(raw_roots)?;
+            let target_prefix_bytes = target_prefix.as_os_str().as_bytes();
+            let roots_display = roots.iter().map(|root| root.to_string_lossy()).join(":");
+
+            if !roots.iter().any(|root| {
+                target_prefix_bytes.starts_with(root.as_bytes())
+                    || root.as_bytes().starts_with(target_prefix_bytes)
+            }) {
+                bail!(
+                    "`{ZUPER_CARGO_TARGET_ROOT}` rejects the target directory beginning at `{}`: it cannot have a literal prefix match in the configured allowed roots `{roots_display}`; select a matching directory or correct `{ZUPER_CARGO_TARGET_ROOT}`",
+                    target_prefix.display()
+                );
+            }
+
+            if !roots.iter().any(|root| {
+                build_dir
+                    .as_os_str()
+                    .as_bytes()
+                    .starts_with(root.as_bytes())
+            }) {
+                bail!(
+                    "`{ZUPER_CARGO_TARGET_ROOT}` rejects the build directory `{}`: it does not have a literal prefix match in the configured allowed roots `{roots_display}`; select a matching directory or correct `{ZUPER_CARGO_TARGET_ROOT}`",
+                    build_dir.display()
+                );
+            }
+
+            Ok(())
         }
     }
 
@@ -2559,6 +2686,8 @@ mod tests {
     use super::GlobalContext;
     use super::Shell;
     use super::disables_multiplexing_for_bad_curl;
+    use std::collections::HashMap;
+    use std::path::Path;
 
     #[test]
     fn disables_multiplexing() {
@@ -2601,5 +2730,83 @@ mod tests {
     fn sync_context() {
         fn assert_sync<S: Sync>() {}
         assert_sync::<GlobalContext>();
+    }
+
+    #[cfg(unix)]
+    fn context_with_target_root_policy(value: Option<&str>) -> GlobalContext {
+        let mut gctx = GlobalContext::new(Shell::new(), "/workspace".into(), "/home".into());
+        let mut env = HashMap::new();
+        if let Some(value) = value {
+            env.insert("ZUPER_CARGO_TARGET_ROOT".to_owned(), value.to_owned());
+        }
+        gctx.set_env(env);
+        gctx
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_root_policy_is_unset_by_default() {
+        let gctx = context_with_target_root_policy(None);
+        assert!(
+            gctx.validate_target_dir_policy(
+                Path::new("/outside/target"),
+                Path::new("/outside/build")
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_root_policy_accepts_literal_prefixes() {
+        let gctx = context_with_target_root_policy(Some("/srv/targets:/mnt/cache"));
+        assert!(
+            gctx.validate_target_dir_policy(
+                Path::new("/srv/targets-extra/project"),
+                Path::new("/mnt/cache/project/build"),
+            )
+            .is_ok()
+        );
+
+        let gctx = context_with_target_root_policy(Some("/srv/targets/"));
+        assert!(
+            gctx.validate_target_dir_policy(
+                Path::new("/srv/targets/project"),
+                Path::new("/srv/targets/project/build"),
+            )
+            .is_ok()
+        );
+        assert!(
+            gctx.validate_target_dir_policy(Path::new("/srv/targets"), Path::new("/srv/targets"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_root_policy_rejects_mismatch_and_malformed_values() {
+        let gctx = context_with_target_root_policy(Some("/srv/targets"));
+        let error = gctx
+            .validate_target_dir_policy(Path::new("/tmp/target"), Path::new("/srv/targets/build"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ZUPER_CARGO_TARGET_ROOT"));
+        assert!(error.contains("target directory"));
+        assert!(error.contains("/tmp/target"));
+
+        for value in ["", ":/srv/targets", "/srv/targets:", "relative/path"] {
+            let gctx = context_with_target_root_policy(Some(value));
+            let error = gctx
+                .validate_target_dir_policy(
+                    Path::new("/srv/targets/project"),
+                    Path::new("/srv/targets/project/build"),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("ZUPER_CARGO_TARGET_ROOT"),
+                "{value:?}: {error}"
+            );
+        }
     }
 }
