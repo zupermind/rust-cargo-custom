@@ -1,0 +1,7 @@
+schema_version: v1
+source_up: false
+finding_overrides:
+  - code: GITHUB-INFRA-RUST-POLICY
+    instance_key: zupermind/rust-cargo-custom
+    disposition: allow
+    reason: "This compiler-toolchain repository is explicitly exempt from the organization deployment ruleset."
